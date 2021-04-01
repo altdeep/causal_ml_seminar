@@ -1,0 +1,239 @@
+---
+title: "Causal Generative Modeling Workflow"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r, 02_setup,include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.path="fig/")
+```
+
+## Workflow introduction
+
+Here are the steps of our causal model-building workflow.
+
+1. Use a basic graphical modeling language (bnlearn, pgmpy) to build a directed acyclic graph (DAG) representing your causal assumptions about the system.
+2. Empirically validate the conditional independence assumptions of your graph.
+3. Train a preliminary causal model and apply traditional model evaluation techniques.
+4. Validate the causal assumptions using experimental data (if available).
+5. Rebuild your model in a probabilistic programming language with more nuanced parametric assumptions.
+6. Optimize performance of the probabilistic program (e.g., cross-validation, posterior predictive checks)
+
+In part 1 of the tutorial, we'll do steps 1, 2, and 3.
+
+## Installing and loading `bnlearn`
+
+`bnlearn` is an R package for directed graphical models.  It is the best package available for learning graph structure (including causal graph structure) from data, though that is beyond the scope of this tutorial.
+
+An alternative Python package is [`pgmpy`](https://pgmpy.org/). 
+
+```{r, 02_install, fig.height=7, fig.width =7, echo=FALSE, fig.align='center', message=FALSE}
+install.packages(c("bnlearn", "BiocManager"), quiet=TRUE, repos="https://cloud.r-project.org")
+BiocManager::install('Rgraphviz', update=FALSE, ask=FALSE, quiet=TRUE)
+
+library(bnlearn)
+```
+
+## Building the model.
+
+We are building a model of how public transportation choices vary across social groups. The variables in the data generating process are _age_ (A), _sex_ (S), _education_ (E), _occupation_ (O), _residence_ (R, size of the place where someone lives), and _travel_ (T, how they get to work).
+
+We draw our assumptions into the following graph.
+
+```{r, echo=FALSE, fig.width=3, fig.height=3, fig.align='center'}
+graphviz.plot(model2network("[A][S][E|A:S][O|E][R|E][T|O:R]"), layout = "neato")
+```
+
+That graph presents a factorization of the joint probability distribution. $Pr(A, S, E, O, R, T) = Pr(A) Pr(S) Pr(E | A, S) Pr(O | E) Pr(R | E) Pr(T | O, R).$
+
+`bnlearn` will let us specify that factorization as a string:
+
+```{r}
+factorization <- "[A][S][E|A:S][O|E][R|E][T|O:R]"
+```
+
+We can build the model directly from the string.
+
+```{r, fig.width=3, fig.height=3, fig.align='center'}
+dag <- model2network(factorization)
+graphviz.plot(dag)
+```
+
+You can built the model in terms of edges ("arcs" in PGM lingo) if that is your preference.
+
+```{r, 02_survey_dag, fig.width=3, fig.height=3, fig.align='center'}
+dag2 <- empty.graph(nodes = c("A","S","E","O","R","T"))
+arc.set <- matrix(c("A", "E",
+                    "S", "E",
+                    "E", "O",
+                    "E", "R",
+                    "O", "T",
+                    "R", "T"),
+                  byrow = TRUE, ncol = 2,
+                  dimnames = list(NULL, c("from", "to")))
+arcs(dag2) <- arc.set
+all.equal(dag, dag2)
+```
+
+## Evaluating the causal DAG
+
+Let's load our transporation data, and split it up into an evaluation, training, and test set.  
+```{r}
+raw_data <- read.delim("https://raw.githubusercontent.com/altdeep/causal_ml_seminar/master/data/survey.txt", sep = " ", stringsAsFactors = T)
+# Let's reshuffle the data to be safe.
+n <- nrow(raw_data)
+idx <- sample(1:n, size = n, replace = FALSE)
+onethird <- floor(n/3)
+eval_data <- raw_data[idx, ][1:onethird, ]
+training_data <- raw_data[idx, ][(onethird+1):(2*onethird), ]
+test_data <- raw_data[idx, ][(2*onethird + 1):n, ]
+
+head(eval_data)
+```
+
+All of the variables in this data set are discrete.  Directed graphical models (AKA Bayesian networks) are not limited to specific parametric assumptions in theory.  But most software places strong limits on the parametric assumptions.  This constraint is the primary reason we'll switch to a probabilistic programming language in the next step.
+
+* **Age (A)**: Recorded as *young* (**young**) for individuals below 30 years, *adult* (**adult**) for individuals between 30 and 60 years old, and *old* (**old**) for people older than 60.
+
+- **Sex (S)**: The biological sex of individual, recorded as *male* (**M**) or *female* (**F**).
+
+- **Education (E)**: The highest level of education or training completed by the individual, recorded either *high school* (**high**) or *university degree* (**uni**).
+
+- **Occupation (O)**: It is recorded as an *employee* (**emp**) or a *self-employed* (**self**) worker.
+
+- **Residence (R)**: The size of the city the individual lives in, recorded as *small* (**small**) or *big* (**big**).
+
+- **Travel (T)**: The means of transport favored by the individual, recorded as *car* (**car**), *train* (**train**) or *other* (**other**)
+
+### Evaluating causal assumptions
+
+The causal assumptions we encoded in the DAG imply that certain sets of variables will be conditionally independent from others.  For example, transportation choice T should be conditionally independent of education level E given occupation and residence.  We can confirm this using the `dsep` method.
+
+```{r}
+dsep(dag, "T", "E", c("O", "R"))
+```
+
+`dsep` checks for D-separation, a graphical modeling concept that connects graph structure to conditional independence.  Defining d-separation is beyond the scope of this tutorial.  I recommend tools like [daggity](http://dagitty.net/) to experiment with d-separation through an intuitive interface.
+
+A fundamental assumption of a causal model is that d-separation maps to conditional independence in the underlying probability distribution.  We can test that assumption using a conditional independence test.
+
+```{r}
+ci.test("T", "E", c("O", "R"), data=eval_data)
+```
+
+The null hypothesis is that T and E are independent after conditioning on O and R.  `mi` is an estimate of the conditional mutual information between T and E.  For a given `df` (degrees of freedom), higher `mi` means more evidence of dependence.  The p-value quantifies the significance of that `mi` number.  The lower the p-value, the more significant.  Usually, one looks for the p-value to be below a threshold like .05.  This p-value is pretty high.  This test suggests a low amount evidence of conditional dependence.  This result supports our causal assumption of conditional independence.
+
+We repeat this procedure for as many implied independence relations that we can test.  If we find evidence of dependence where our causal model says there should be none, we need to go back and improve the DAG.
+
+If you don't like the frequentist test approach described here, you can create different DAGs, each encoding different independence assumptions, and compare them using model comparison techniques.
+
+`bnlearn` provides a `score` function which allows us to implement model comparison techniques such as likelihood ratio and Bayes factor tests.
+
+```{r}
+score(dag, eval_data, method='loglik')
+```
+
+Note that this step cannot confirm our causal assumptions.  It can only falsify them.
+
+## Training a preliminary causal model
+
+We go through a training step in order to convert our causal DAG to a probabilistic generative model.  A generative model will allow us to apply normal statistical model validation techniques such as cross-validation.
+
+Note that such techniques only evaluate things like goodness-of-fit or predictive performance.  They do not provide evidence for our causal assumptions.
+
+`bnlearn` models continuous variables as Gaussian.  Gaussian's can approximate non-Gaussian distribution, but you may want to transform some of your variables first.  For transformations, use linear regression best practices such as the [Box Cox transformation](https://www.statisticshowto.com/box-cox-transformation/).
+
+My preference is to convert continuous variables to discrete variables.  `bnlearn`'s [`discretize`](https://www.bnlearn.com/documentation/man/preprocessing.html) method makes this easy.  I recommend using  _Hartemink's pairwise mutual information_ (see docs) method of discretization because it will minimize the information lost by the discretization process.
+
+We'll use a Bayesian approach to fit the model parameters.  The alternative is maximum likelihood estimation, but that can get us in trouble for low-count combinations.  See the docs for details.
+
+```{r}
+model <- bn.fit(dag, data = training_data, method = "bayes")
+```
+
+Let's look at the causal conditional probability distributions. (causal Markov kernel) for P(T|O, S).  Since we are working with categorical variables, this will be a conditional probability table.  The values of the table are the fitted parameters.
+
+```{r}
+model$T
+```
+
+Importantly, you can also specify the parameters of the model yourself.
+
+```{r, 02_cpt_build}
+A.lv <- c("young", "adult", "old")
+S.lv <- c("M", "F")
+E.lv <- c("high", "uni")
+O.lv <- c("emp", "self")
+R.lv <- c("small", "big")
+T.lv <- c("car", "train", "other")
+
+A.prob <- array(c(0.3,0.5,0.2), dim = 3, dimnames = list(A = A.lv))
+S.prob <- array(c(0.6,0.4), dim = 2, dimnames = list(S = S.lv))
+E.prob <- array(c(0.75,0.25,0.72,0.28,0.88,0.12,0.64,0.36,0.70,0.30,0.90,0.10), dim = c(2,3,2), dimnames = list(E = E.lv, A = A.lv, S = S.lv))
+O.prob <- array(c(0.96,0.04,0.92,0.08), dim = c(2,2), dimnames = list(O = O.lv, E = E.lv))
+R.prob <- array(c(0.25,0.75,0.2,0.8), dim = c(2,2), dimnames = list(R = R.lv, E = E.lv))
+T.prob <- array(c(0.48,0.42,0.10,0.56,0.36,0.08,0.58,0.24,0.18,0.70,0.21,0.09), dim = c(3,2,2), dimnames = list(T = T.lv, O = O.lv, R = R.lv))
+cpt <- list(A = A.prob, S = S.prob, E = E.prob, O = O.prob, R = R.prob, T = T.prob)
+
+custom_model <- custom.fit(dag, cpt)
+
+custom_model$T
+```
+
+### Simulation and probability queries on the trained model
+
+To simulate data from the trained model, use `rbn`.
+
+```{r}
+rbn(model, n=5)
+```
+
+You can also predict some variables given others.  In this snippet, we'll predict the education levels on the test data.
+
+```{r}
+predictions <- predict(model, node = "E", data = test_data,
+               method = "bayes-lw", prob = TRUE)
+head(predictions)
+```
+
+We can compare the predictions to the actual values to quantify predictive performance.  The following snippet gives us the classification error rate.
+
+```{r}
+sum(predictions != test_data$E)/nrow(test_data)
+```
+
+`bnlearn` also let's you apply conditional probability queries using `cpdist` and `cpquery`.  That said, its inference algorithms are not particularly good.  A better option in R is to convert the model to an object in the [gRain](https://cran.r-project.org/web/packages/gRain/gRain.pdf) library.
+
+## Validate the causal assumptions using experimental data
+
+A causal model can simulate interventions.  In `bnlearn`, we apply the `mutilate` method to simulate an intervention on residence (R) that sets it to "small".
+
+```{r}
+intervention <- list(R = "small")
+intervention_model <- mutilated(model, evidence=intervention)
+```
+
+The intervention removes incoming edges to R.
+```{r, , fig.width=3, fig.height=3, fig.align='center'}
+graphviz.plot(intervention_model)
+```
+
+It also puts all the probability on R == "small".
+
+```{r}
+intervention_model$R
+```
+
+We can predict variables with the intervention model.
+
+```{r}
+intervention_predictions <- predict(intervention_model, node = "T", data = test_data,  method = "bayes-lw", prob = TRUE)
+```
+
+If we had experimental data, we could compare those predictions to the experimental data.  Experimental data in this case would be a randomized trial that randomly sent people to work in big cities or small cities.  If the predictions and experimental results didn't align, we will have falsified our causal model.  If that happens, we need to reevaluate the model.  At this stage, the problem will most likely due to the structure, not the parametric assumptions.
+
+## Implementing in a probabilistic programming language.
+
+Once we have validated our the causal assumptions and predictive quality of our model, we're ready to convert it to more nuanced model with a probabilistic programming language. 
